@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yoto-archive"
+version = "0.1.0"
+description = "Back up normal Yoto card artwork, icons, and audio"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.scripts]
+yoto-archive = "yoto_archive:main"
+
+[tool.setuptools]
+py-modules = ["yoto_archive"]
