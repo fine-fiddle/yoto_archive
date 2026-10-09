@@ -1,0 +1,10 @@
+{
+  "cards": [
+    {"cardId": "purchased", "card": {"cardId": "purchased", "title": "Purchased story", "metadata": {"category": "stories"}}},
+    {"cardId": "virtual", "card": {"cardId": "virtual", "title": "Virtual story", "metadata": {"category": "stories"}}},
+    {"cardId": "myo", "card": {"cardId": "myo", "title": "My playlist", "metadata": {"category": "stories"}}},
+    {"cardId": "linked", "card": {"cardId": "myo", "title": "Linked MYO", "metadata": {"category": "stories"}}},
+    {"cardId": "radio", "card": {"cardId": "radio", "title": "Radio", "metadata": {"category": "radio"}}},
+    {"cardId": "podcast", "card": {"cardId": "podcast", "title": "Podcast", "metadata": {"category": "podcasts", "feedUrl": "https://feeds.example/show.rss"}}}
+  ]
+}

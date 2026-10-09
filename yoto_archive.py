@@ -1,4 +1,4 @@
-"""Back up the downloadable assets embedded in a Yoto card's share page."""
+"""Back up Yoto cards from a share page or the authenticated account API."""
 
 from __future__ import annotations
 
@@ -22,6 +22,10 @@ from urllib.request import Request, urlopen
 
 class ArchiveError(Exception):
     """An invalid card page, unavailable asset, or incomplete download."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class _PageDataParser(HTMLParser):
@@ -53,6 +57,12 @@ def card_from_html(html: str) -> dict:
         card = data["props"]["pageProps"]["card"]
     except (ValueError, KeyError, TypeError):
         raise ArchiveError("The page does not contain valid Yoto card data.") from None
+    if card is None:
+        raise ArchiveError("The share page does not expose this card's content. Retry with --token-file for an authenticated backup.")
+    return _validate_card(card)
+
+
+def _validate_card(card) -> dict:
     if not isinstance(card, dict) or not isinstance(card.get("title"), str) or not card["title"].strip():
         raise ArchiveError("The card data is missing its title.")
     content = card.get("content")
@@ -85,13 +95,23 @@ def _web_url(value: str) -> str:
 
 
 @contextmanager
-def _response(url: str, timeout: float, label: str):
+def _response(url: str, timeout: float, label: str, access_token: str | None = None, *, policy=None):
     request = Request(_web_url(url), headers={"User-Agent": "yoto-archive/0.1"})
+    if access_token:
+        # urllib omits unredirected headers when following a redirect. Never
+        # forward an account token to a redirected host or a media download.
+        request.add_unredirected_header("Authorization", f"Bearer {access_token}")
     try:
-        response = urlopen(request, timeout=timeout)
+        response = policy.open(request, timeout) if policy is not None else urlopen(request, timeout=timeout)
     except HTTPError as exc:
-        hint = " The link may have expired; rerun with the full NFC URL." if exc.code in (401, 403) else ""
-        raise ArchiveError(f"Could not download {label}: HTTP {exc.code}.{hint}") from None
+        exc.close()
+        if access_token and exc.code in (401, 403):
+            hint = " Refresh the account token and check its library/audio permissions."
+        elif access_token and exc.code == 404:
+            hint = " This card may not be available in the authenticated account."
+        else:
+            hint = " The link may have expired; rerun with the full NFC URL." if exc.code in (401, 403) else ""
+        raise ArchiveError(f"Could not download {label}: HTTP {exc.code}.{hint}", status_code=exc.code) from None
     except (URLError, OSError, HTTPException) as exc:
         reason = getattr(exc, "reason", exc)
         # Never include URLs or credentials in network errors.
@@ -107,7 +127,51 @@ def _read(response, size: int, label: str) -> bytes:
         raise ArchiveError(f"Could not download {label}: {type(exc).__name__}. Check the connection and retry.") from None
 
 
-def fetch_card(url: str, timeout: float = 30) -> dict:
+def _card_id(value: str) -> str:
+    """Accept a content ID or a recognized NFC/share URL for account lookup."""
+    if re.fullmatch(r"[A-Za-z0-9]{1,64}", value):
+        return value
+    parts = urlsplit(_web_url(value))
+    if parts.hostname == "yoto.io" and parts.port in (None, 80, 443):
+        card_id = parts.path.removeprefix("/")
+    elif parts.hostname == "share.yoto.co" and parts.port in (None, 80, 443) and parts.path.startswith("/p/"):
+        card_id = parts.path[3:]
+    else:
+        raise ArchiveError("Authenticated backup requires a yoto.io URL, share.yoto.co/p/ URL, or card ID.")
+    if not re.fullmatch(r"[A-Za-z0-9]{1,64}", card_id):
+        raise ArchiveError("The Yoto URL does not contain a valid card ID.")
+    return card_id
+
+
+def read_access_token(path: Path | str) -> str:
+    """Read a raw bearer token or an OAuth JSON response without logging it."""
+    try:
+        value = Path(path).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        raise ArchiveError("Could not read the token file. Check its path and permissions.") from None
+    if value.startswith("{"):
+        try:
+            value = json.loads(value).get("access_token")
+        except (ValueError, AttributeError):
+            value = None
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", value):
+        raise ArchiveError("The token file must contain a raw access token or JSON with an access_token field.")
+    return value
+
+
+def fetch_card(url: str, timeout: float = 30, *, access_token: str | None = None) -> dict:
+    if access_token is not None:
+        card_id = _card_id(url)
+        # /card resolves the content linked to physical MYO cards as well as
+        # library cards; /content alone does not resolve this linked content.
+        api_url = f"https://api.yotoplay.com/card/{card_id}?playable=true&signingType=s3"
+        with _response(api_url, timeout, "account card", access_token) as response:
+            try:
+                data = json.loads(_read(response, -1, "account card"))
+                card = data["card"]
+            except (ValueError, KeyError, TypeError):
+                raise ArchiveError("The account API did not return valid card data.") from None
+        return _validate_card(card)
     with _response(url, timeout, "card page") as response:
         html = _read(response, -1, "card page").decode(response.headers.get_content_charset() or "utf-8")
     return card_from_html(html)
@@ -149,8 +213,8 @@ def _extension(content_type: str, url: str, audio_format: str | None) -> str:
 
 
 def _download(url: str, root: Path, stem: str, timeout: float, audio_format: str | None = None,
-              expected_size: int | None = None) -> dict:
-    with _response(url, timeout, stem) as response:
+              expected_size: int | None = None, *, policy=None) -> dict:
+    with _response(url, timeout, stem, policy=policy) as response:
         content_type = response.headers.get_content_type() if response.headers.get("Content-Type") else "application/octet-stream"
         if content_type in ("text/html", "application/json", "text/plain", "application/vnd.apple.mpegurl",
                             "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl", "application/dash+xml"):
@@ -187,8 +251,9 @@ def _icon(item: dict):
     return _object(item.get("display")).get("icon16x16")
 
 
-def backup_card(url: str, output: Path | str = "archives", timeout: float = 30, progress=print) -> Path:
-    card = fetch_card(url, timeout)
+def backup_card(url: str, output: Path | str = "archives", timeout: float = 30, progress=print,
+                *, access_token: str | None = None) -> Path:
+    card = fetch_card(url, timeout, access_token=access_token)
     output = Path(output)
     destination = output / safe_name(card["title"])
     if destination.exists() or destination.is_symlink():
@@ -255,12 +320,27 @@ def _timeout(value: str) -> float:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Back up a Yoto card's cover, track icons, and audio.")
-    parser.add_argument("url", help="full NFC/share URL, including its query string")
-    parser.add_argument("--output", "-o", type=Path, default=Path("archives"), help="parent directory for archives (default: archives)")
+    parser.add_argument("url", nargs="?", help="full NFC/share URL, or a card ID when using --token-file")
+    parser.add_argument("--output", "-o", type=Path, help="archive directory (default: archives, or archives/<account ID> with --account)")
     parser.add_argument("--timeout", type=_timeout, default=30, help="network timeout in seconds (default: 30)")
+    parser.add_argument("--token-file", type=Path, help="account access token file (raw token or OAuth JSON) for virtual/MYO cards")
+    parser.add_argument("--account", action="store_true", help="incrementally back up the full account library and MYO content")
+    parser.add_argument("--list", action="store_true", help="list account content without downloading media (requires --account)")
+    parser.add_argument("--request-interval", type=_timeout, default=1, help="minimum seconds between account requests (default: 1)")
     args = parser.parse_args(argv)
+    if args.account:
+        if args.url or args.token_file is None:
+            parser.error("--account requires --token-file and does not take a card URL")
+    elif args.url is None or args.list:
+        parser.error("provide a card URL, or use --account with --token-file; --list requires --account")
     try:
-        destination = backup_card(args.url, args.output, args.timeout)
+        token = read_access_token(args.token_file) if args.token_file is not None else None
+        if args.account:
+            from yoto_account import backup_account, list_account
+            function = list_account if args.list else backup_account
+            result = function(token, output=args.output, timeout=args.timeout, interval=args.request_interval)
+            return 0 if result["complete"] else 1
+        destination = backup_card(args.url, args.output or Path("archives"), args.timeout, access_token=token)
     except (ArchiveError, OSError, UnicodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

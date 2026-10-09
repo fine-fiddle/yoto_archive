@@ -1,0 +1,5 @@
+{
+  "cards": [
+    {"cardId": "myo", "title": "My playlist", "content": {"version": "1"}, "metadata": {"category": "stories"}}
+  ]
+}
