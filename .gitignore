@@ -6,3 +6,5 @@ dist/
 .venv/
 archives/
 account_info
+yoto_account
+yoto_token*

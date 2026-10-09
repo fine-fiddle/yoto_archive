@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import urldefrag
+from urllib.request import HTTPRedirectHandler
 
 import yoto_archive as archive
 
@@ -265,7 +266,120 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr.getvalue())
 
 
+class AuthenticatedBackupTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.output = self.root / "archives"
+        self.card = sample_card()
+        self.token = "account-token-secret"
+        self.api_url = "https://api.yotoplay.com/card/test?playable=true&signingType=s3"
+        self.api_body = None
+        self.api_error = None
+        self.requests = []
+        self.patcher = patch.object(archive, "urlopen", self.urlopen)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def urlopen(self, request, timeout):
+        self.requests.append(request)
+        if request.full_url == self.api_url:
+            if self.api_error:
+                raise self.api_error
+            body = self.api_body if self.api_body is not None else json.dumps({"card": self.card}).encode()
+            return FakeResponse(body, "application/json")
+        if request.full_url == urldefrag(AUDIO_URL)[0]:
+            return FakeResponse(AUDIO, "audio/mp4")
+        if request.full_url in ("https://media.example/cover", "https://media.example/icon"):
+            return FakeResponse(IMAGE, "image/png")
+        self.fail(f"Unexpected request to {request.full_url}")
+
+    def test_linked_card_backup_uses_account_api_and_keeps_token_private(self):
+        path = archive.backup_card(PAGE_URL, self.output, access_token=self.token, progress=None)
+        self.assertEqual(self.requests[0].full_url, self.api_url)
+        self.assertEqual(self.requests[0].get_header("Authorization"), f"Bearer {self.token}")
+        self.assertTrue(all(request.get_header("Authorization") is None for request in self.requests[1:]))
+        manifest = (path / "manifest.json").read_text()
+        for secret in (self.token, "card-secret", "download-secret", "private-user-id"):
+            self.assertNotIn(secret, manifest)
+        self.assertEqual((path / "tracks/001 - First _ track.m4a").read_bytes(), AUDIO)
+        self.assertTrue((path / "cover.png").is_file())
+        self.assertTrue((path / "icons/001 - First _ track.png").is_file())
+
+    def test_token_is_not_forwarded_on_redirects(self):
+        archive.fetch_card("test", access_token=self.token)
+        redirected = HTTPRedirectHandler().redirect_request(
+            self.requests[0], None, 302, "Found", Message(), "https://other.example/card")
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_card_ids_and_share_links_resolve_without_fetching_share_page(self):
+        for value in ("test", PAGE_URL, "https://share.yoto.co/p/test?secret=value"):
+            with self.subTest(value=value):
+                self.assertEqual(archive.fetch_card(value, access_token=self.token)["title"], self.card["title"])
+        self.assertEqual([request.full_url for request in self.requests], [self.api_url] * 3)
+
+    def test_unrecognized_urls_fail_without_sending_credentials(self):
+        for value in ("https://other.example/test", "https://yoto.io.evil.example/test",
+                      "https://yoto.io:8080/test", "https://yoto.io/../test",
+                      "https://yoto.io/test/extra", "https://share.yoto.co/test",
+                      "https://user:password@yoto.io/test", "file:///test"):
+            with self.subTest(value=value), self.assertRaises(archive.ArchiveError):
+                archive.fetch_card(value, access_token=self.token)
+        self.assertEqual(self.requests, [])
+
+    def test_account_errors_are_actionable_and_do_not_expose_secrets(self):
+        for code, hint in ((401, "Refresh the account token"), (403, "permissions"), (404, "authenticated account")):
+            self.api_error = HTTPError(self.api_url, code, self.token, None, None)
+            with self.subTest(code=code), self.assertRaisesRegex(archive.ArchiveError, hint) as caught:
+                archive.backup_card(PAGE_URL, self.output, access_token=self.token, progress=None)
+            self.assertNotIn(self.token, str(caught.exception))
+            self.assertNotIn(self.api_url, str(caught.exception))
+            self.assertFalse(self.output.exists())
+
+    def test_invalid_api_data_fails_before_downloading_assets(self):
+        for body in (b"not-json", b"null", b"{}", b'{"card":null}'):
+            self.api_body = body
+            with self.subTest(body=body), self.assertRaises(archive.ArchiveError):
+                archive.backup_card("test", self.output, access_token=self.token, progress=None)
+            self.assertFalse(self.output.exists())
+        self.api_body = None
+        self.card["content"]["chapters"][0]["tracks"][0]["trackUrl"] = "yoto:#unresolved"
+        with self.assertRaises(archive.ArchiveError):
+            archive.backup_card("test", self.output, access_token=self.token, progress=None)
+        self.assertFalse(self.output.exists())
+        self.assertTrue(all(request.full_url == self.api_url for request in self.requests))
+
+    def test_cli_accepts_raw_token_and_oauth_json_files(self):
+        for number, contents in enumerate((self.token + "\n", json.dumps({"access_token": self.token, "id_token": "unused"}))):
+            token_file = self.root / "token.json"
+            token_file.write_text(contents)
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
+                result = archive.main([PAGE_URL, "--output", str(self.output / str(number)), "--token-file", str(token_file)])
+            self.assertEqual(result, 0, stderr.getvalue())
+            self.assertTrue((self.output / str(number) / archive.safe_name(self.card["title"]) / "manifest.json").is_file())
+
+    def test_invalid_token_files_fail_before_network_access(self):
+        token_file = self.root / "token.json"
+        for contents in (b"", b"{broken", b"{}", b"[]", b'{"access_token":null}',
+                         b'{"access_token":42}', b"one\ntwo", b"token\x00secret", b"\xff"):
+            token_file.write_bytes(contents)
+            with self.subTest(contents=contents), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
+                result = archive.main([PAGE_URL, "--token-file", str(token_file)])
+            self.assertEqual(result, 1)
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertNotIn("secret", stderr.getvalue())
+        token_file.unlink()
+        with self.assertRaisesRegex(archive.ArchiveError, "Could not read the token file"):
+            archive.read_access_token(token_file)
+        self.assertEqual(self.requests, [])
+
+
 class ParsingTests(unittest.TestCase):
+    def test_private_share_page_explains_authenticated_backup(self):
+        with self.assertRaisesRegex(archive.ArchiveError, "--token-file"):
+            archive.card_from_html(page(None))
+
     def test_missing_or_malformed_page_data_is_readable(self):
         for html in ("<html>no data</html>", '<script id="__NEXT_DATA__">broken</script>',
                      '<script id="__NEXT_DATA__">null</script>', '<script id="__NEXT_DATA__">{}</script>'):
